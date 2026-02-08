@@ -23,7 +23,7 @@ jobs:
               repo: context.repo.repo,
               labels: ['fix']
             })
-      - uses: google-labs-code/jules-invoke@v1
+      - uses: google-labs-code/jules-invoke@main
         with:
           prompt: "Analyze the current PR and the latest review comments. Apply the requested fixes and update the branch."
           api_key: ${{ secrets.JULES_API_KEY }}
