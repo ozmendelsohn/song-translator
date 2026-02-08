@@ -1,0 +1,29 @@
+name: Jules Auto-Fix
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  jules-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag PR with fix
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['fix']
+            })
+      - uses: google-labs-code/jules-invoke@v1
+        with:
+          prompt: "Analyze the current PR and the latest review comments. Apply the requested fixes and update the branch."
+          api_key: ${{ secrets.JULES_API_KEY }}
