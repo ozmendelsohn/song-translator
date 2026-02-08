@@ -1,0 +1,11 @@
+gradio
+demucs
+openai-whisper
+deep-translator
+edge-tts
+pydub
+torch>=2.5.1
+torchaudio>=2.5.1
+ffmpeg-python
+imageio-ffmpeg
+soundfile
