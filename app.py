@@ -40,4 +40,5 @@ with gr.Blocks(title="Song Translator PoC") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    print("If running on WSL, access the interface at http://localhost:7860")
+    demo.launch(server_name="127.0.0.1", server_port=7860)
