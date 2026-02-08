@@ -1,74 +1,56 @@
-# Report: Automated Song Translation with Off-the-Shelf Models
+# Report: Automated Song Translation with Hugging Face Models
 
 ## Executive Summary
-This report outlines a strategy for translating songs from one language to another while attempting to preserve the original musical elements (melody, structure, beat, timbre). The proposed solution leverages state-of-the-art, open-source AI models available on Hugging Face and other repositories, focusing on ease of implementation and local execution capabilities.
+This report outlines a strategy for translating songs from one language to another using state-of-the-art open-source AI models, primarily leveraging the Hugging Face ecosystem. The solution focuses on preserving the original instrumental track while replacing the vocals with a translated version.
 
 ## Problem Analysis
 Translating a song involves several distinct challenges:
 1.  **Source Separation:** Isolating the vocal track from the instrumental accompaniment.
 2.  **Transcription (ASR):** Accurately converting the singing voice to text (lyrics) and capturing timing information.
-3.  **Translation:** Converting lyrics to the target language. A key challenge here is **rhythm and meter preservation**—translated lyrics often have different syllable counts and stress patterns than the original, making them difficult to sing to the original melody without adaptation.
-4.  **Synthesis (TTS/SVS):** Generating singing voice in the target language.
-5.  **Voice Conversion (VC):** Modifying the synthesized voice to match the timbre of the original singer.
-6.  **Mixing:** Recombining the new vocals with the original instrumental track.
+3.  **Translation:** Converting lyrics to the target language. A key challenge here is **rhythm and meter preservation**.
+4.  **Synthesis (TTS):** Generating singing/spoken voice in the target language.
+5.  **Mixing:** Recombining the new vocals with the original instrumental track.
 
 ## Recommended Pipeline (Proof of Concept)
 
-We propose a modular pipeline using the following "off-the-shelf" components:
+We propose a modular pipeline using the following components:
 
 ### 1. Source Separation: `Demucs` (Hybrid Transformer Demucs)
 - **Role:** Isolate vocals from the instrumental backing track.
-- **Why:** State-of-the-art quality, widely used, open-source (Facebook Research).
-- **Alternative:** `Spleeter` (faster but lower quality).
+- **Why:** State-of-the-art quality, widely used, available via `torchaudio` or standalone CLI.
 
-### 2. Transcription: `Whisper` (OpenAI)
+### 2. Transcription: `Whisper` (OpenAI via Hugging Face or PyPI)
 - **Role:** Transcribe the isolated vocal track to get the original lyrics and timestamps.
-- **Why:** Robust performance on diverse audio, including singing; provides word-level timestamps which are crucial for alignment.
+- **Why:** Robust performance on diverse audio; provides word-level timestamps crucial for alignment.
 
-### 3. Translation: `NLLB` (No Language Left Behind) or `Google Translate` API
+### 3. Translation: `NLLB` (No Language Left Behind)
+- **Model:** `facebook/nllb-200-distilled-600M`
 - **Role:** Translate lyrics to the target language.
-- **Why:** `NLLB` is a high-quality open model from Meta. For simplicity in a PoC, `googletrans` (unofficial API) or a simple HF model can be used.
-- **Note:** Standard translation does not preserve rhyme or meter. This is a complex research problem. For a PoC, we will accept a "literal" translation or use a Large Language Model (LLM) to attempt rhythmic matching.
+- **Why:** A high-quality, open-source multilingual translation model available on **Hugging Face**. It supports over 200 languages and runs locally, satisfying the requirement for "ML models from HF".
 
-### 4. Synthesis & Voice Conversion: `Edge-TTS` + `RVC` (Retrieval-based Voice Conversion)
+### 4. Synthesis: `Edge-TTS` (Interim Solution)
 - **Role:** Generate the singing/spoken voice in the target language.
-- **Why:**
-    - `Edge-TTS` is a free, high-quality TTS engine that supports many languages. It generates speech, not singing.
-    - `RVC` is the current standard for AI voice cloning. It can take an audio input (the TTS speech) and convert its timbre to match a target voice (the original singer).
-    - **Challenge:** To truly "sing", we need a Singing Voice Synthesis (SVS) model. However, high-quality generic SVS models that accept arbitrary text and melody are rare and complex to set up.
-    - **PoC Compromise:** The initial PoC will likely result in a "spoken word" or "melodic speech" version of the translation, as true singing synthesis requires aligning phonemes to musical notes, which is non-trivial without manual intervention.
+- **Why:** While Hugging Face offers models like **Bark** (`suno/bark`) or **MMS** (`facebook/mms-tts`), they are often computationally heavy or require complex setup for multilingual support. `Edge-TTS` provides high-quality, natural-sounding multilingual speech with minimal overhead, making it ideal for a "easiest to implement" PoC.
+- **HF Alternative:** For a pure ML approach, `SpeechT5` (`microsoft/speecht5_tts`) or `Bark` could be swapped in, but with significant performance trade-offs.
 
 ### 5. Mixing: `Pydub` / `FFmpeg`
 - **Role:** Combine the new vocal track with the original instrumental.
+- **Alignment:** We use the start time detected by Whisper to offset the TTS audio, ensuring it starts when the original vocals did.
+
+## Alternative: End-to-End Speech Translation
+**SeamlessM4T (Meta):**
+- **Model:** `facebook/seamless-m4t-v2-large`
+- **Capability:** Direct Speech-to-Speech Translation (S2ST).
+- **Pros:** Single model, handles translation and synthesis.
+- **Cons:** It generates speech from scratch and does not separate or preserve the background music. Using it on a song would result in an a cappella translation or a hallucinated background.
+- **Verdict:** Not suitable for *song* translation where preserving the original backing track is required.
 
 ## Implementation Strategy
+- **Frontend:** Gradio (Web UI).
+- **Backend:** Python script integrating `demucs`, `whisper`, `transformers` (NLLB), and `edge-tts`.
+- **Dependency Management:** `uv` is used for fast and reliable package management.
+- **Hardware:** GPU recommended for Demucs, Whisper, and NLLB.
 
-### Frontend: Gradio
-We will build a web-based UI using **Gradio**. It is:
-- **Easy to implement:** Python-based, requires minimal frontend code.
-- **Interactive:** Allows users to upload audio, select target languages, and play back results.
-- **Local:** Runs locally in the browser or can be hosted.
-
-### Backend: Python
-The backend will orchestrate the pipeline:
-1.  Receive audio file.
-2.  Run `demucs` to split stems.
-3.  Run `whisper` on `vocals.wav` to get text.
-4.  Translate text.
-5.  Run TTS on translated text to generate `tts_vocals.wav`.
-    - *Advanced:* Stretch/warp `tts_vocals.wav` to match the duration of original phrases.
-6.  (Optional) Run RVC to style transfer `tts_vocals.wav` to look like `vocals.wav`.
-7.  Mix `tts_vocals.wav` with `no_vocals.wav`.
-8.  Return the final audio.
-
-## Technical Requirements (Local Execution)
-- **Python 3.8+**
-- **FFmpeg** (installed on system)
-- **GPU (CUDA):** Highly recommended for `Demucs`, `Whisper`, and `RVC`. Can run on CPU but will be slow.
-- **Disk Space:** ~5-10GB for models.
-
-## Future Improvements / WebAssembly
-While the user requested "WebAssembly using GPU", running heavy models like `Demucs` (separation) and `RVC` (voice conversion) entirely client-side via WASM is currently experimental and performance-heavy.
-- **Partial WASM:** `Whisper` and some TTS models can run in-browser via `Transformers.js`.
-- **Full WASM:** A full pipeline would likely crash a browser tab due to memory/compute limits.
-- **Recommendation:** A local Python server with a lightweight web UI is the most robust and "easiest to implement" solution today.
+## Future Improvements
+- **Singing Voice Synthesis (SVS):** Replace `Edge-TTS` with a model trained specifically for singing (e.g., `Diff-SVC` or `So-VITS-SVC`), conditioned on the melody extracted from the original vocals.
+- **Rhythm Adaptation:** Use an LLM to rewrite translated lyrics to match the syllable count of the original lines.
