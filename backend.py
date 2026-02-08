@@ -94,7 +94,7 @@ def process_audio_seamless(audio_path, target_lang="es", output_path="translated
     if translated_waveform.dim() == 1:
         translated_waveform = translated_waveform.unsqueeze(0)
 
-    torchaudio.save(output_path, translated_waveform, 16000)
+    torchaudio.save(output_path, translated_waveform, model.config.sampling_rate)
 
     return output_path
 
