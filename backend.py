@@ -24,7 +24,7 @@ def load_seamless_model():
 
     return SEAMLESS_PROCESSOR, SEAMLESS_MODEL
 
-def process_audio_seamless(audio_path, target_lang="spa", output_path="translated_vocals.wav"):
+def process_audio_seamless(audio_path, target_lang="es", output_path="translated_vocals.wav"):
     """
     Translates audio to target language using SeamlessM4T v2.
     Returns path to translated audio.
@@ -50,16 +50,18 @@ def process_audio_seamless(audio_path, target_lang="spa", output_path="translate
         "en": "eng"
     }
 
-    if target_lang not in lang_map:
-        raise ValueError(f"Unsupported target language: {target_lang}. Supported: {list(lang_map.keys())}")
-
-    tgt_lang_code = lang_map[target_lang]
+    if target_lang in lang_map:
+        tgt_lang_code = lang_map[target_lang]
+    elif target_lang in lang_map.values():
+        tgt_lang_code = target_lang
+    else:
+        raise ValueError(f"Unsupported target language: {target_lang}. Supported keys: {list(lang_map.keys())}, values: {list(lang_map.values())}")
 
     try:
         # Load audio
         waveform, sample_rate = torchaudio.load(audio_path)
     except Exception as e:
-        raise RuntimeError(f"Failed to load audio file {audio_path}: {e}")
+        raise RuntimeError(f"Failed to load audio file {audio_path}: {e}") from e
 
     processor, model = load_seamless_model()
     device = model.device
@@ -167,6 +169,8 @@ def detect_leading_silence(waveform, sample_rate, silence_threshold_db=-50.0, ch
         wave_mono = torch.abs(waveform[0])
 
     length = wave_mono.shape[0]
+    if length == 0:
+        return 0.0
 
     # Iterate in chunks to find start
     # Pad to multiple of chunk_samples
