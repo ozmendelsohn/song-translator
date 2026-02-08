@@ -3,24 +3,41 @@ import shutil
 import subprocess
 import torch
 from pathlib import Path
-from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToSpeech
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
 import torchaudio
 
 # Global model cache
 SEAMLESS_PROCESSOR = None
 SEAMLESS_MODEL = None
+USING_LARGE_MODEL = True
 
-def load_seamless_model():
+def load_seamless_model(force_medium=False):
     """Loads the SeamlessM4T v2 model if not already loaded."""
-    global SEAMLESS_PROCESSOR, SEAMLESS_MODEL
+    global SEAMLESS_PROCESSOR, SEAMLESS_MODEL, USING_LARGE_MODEL
+
+    # If forced to medium and currently using large (or None), reload
+    if force_medium and USING_LARGE_MODEL:
+        print("Switching to medium model due to OOM...")
+        SEAMLESS_MODEL = None
+        SEAMLESS_PROCESSOR = None
+        USING_LARGE_MODEL = False
+        torch.cuda.empty_cache()
+
     if SEAMLESS_MODEL is None:
-        print("Loading SeamlessM4T v2 model...")
-        model_name = "facebook/seamless-m4t-v2-large"
+        model_name = "facebook/seamless-m4t-v2-large" if USING_LARGE_MODEL else "facebook/seamless-m4t-medium"
+        print(f"Loading SeamlessM4T v2 model ({model_name})...")
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device for SeamlessM4T: {device}")
 
-        SEAMLESS_PROCESSOR = AutoProcessor.from_pretrained(model_name)
-        SEAMLESS_MODEL = SeamlessM4Tv2ForSpeechToSpeech.from_pretrained(model_name).to(device)
+        try:
+            SEAMLESS_PROCESSOR = AutoProcessor.from_pretrained(model_name)
+            SEAMLESS_MODEL = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+        except torch.cuda.OutOfMemoryError:
+            print("OOM during model load. Falling back to medium model.")
+            torch.cuda.empty_cache()
+            USING_LARGE_MODEL = False
+            return load_seamless_model(force_medium=True)
 
     return SEAMLESS_PROCESSOR, SEAMLESS_MODEL
 
@@ -83,11 +100,32 @@ def process_audio_seamless(audio_path, target_lang="es", output_path="translated
 
     print("Running S2ST inference...")
     # Generate translated speech
-    with torch.no_grad():
-        output = model.generate(**inputs, tgt_lang=tgt_lang_code)
+    try:
+        with torch.no_grad():
+            output = model.generate(**inputs, tgt_lang=tgt_lang_code)
+    except torch.cuda.OutOfMemoryError:
+        print("OOM during inference. Clearing cache and retrying with medium model...")
+        del inputs
+        torch.cuda.empty_cache()
+
+        # Reload with medium model forced
+        processor, model = load_seamless_model(force_medium=True)
+        device = model.device
+
+        # Re-prepare inputs
+        inputs = processor(audio=waveform.squeeze(), sampling_rate=16000, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            output = model.generate(**inputs, tgt_lang=tgt_lang_code)
 
     # Output[0] is the waveform tensor
-    translated_waveform = output[0].cpu()
+    # Ensure float32 for torchaudio save
+    translated_waveform = output[0].cpu().float()
+
+    # Cleanup inference memory
+    del inputs
+    del output
+    torch.cuda.empty_cache()
 
     # Save to file
     # torchaudio.save expects (channels, time)
