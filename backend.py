@@ -1,52 +1,89 @@
 import os
 import shutil
-import asyncio
 import subprocess
 import torch
-import whisper
-import transformers
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
-import edge_tts
-
-# Monkeypatch transformers to bypass torch.load CVE check (safe for known models)
-try:
-    # Patch the definition in import_utils
-    transformers.utils.import_utils.check_torch_load_is_safe = lambda: True
-    # Patch the import in modeling_utils if it exists
-    if hasattr(transformers.modeling_utils, "check_torch_load_is_safe"):
-        transformers.modeling_utils.check_torch_load_is_safe = lambda: True
-except Exception as e:
-    print(f"Failed to monkeypatch transformers: {e}")
-from pydub import AudioSegment
+from transformers import AutoProcessor, SeamlessM4Tv2Model
+import torchaudio
 
 # Global model cache
-WHISPER_MODEL = None
-TRANSLATION_MODEL = None
-TRANSLATION_TOKENIZER = None
+SEAMLESS_PROCESSOR = None
+SEAMLESS_MODEL = None
 
-def setup_pipeline():
-    """Loads the Whisper model if not already loaded."""
-    global WHISPER_MODEL
-    if WHISPER_MODEL is None:
-        print("Loading Whisper model...")
+def load_seamless_model():
+    """Loads the SeamlessM4T v2 model if not already loaded."""
+    global SEAMLESS_PROCESSOR, SEAMLESS_MODEL
+    if SEAMLESS_MODEL is None:
+        print("Loading SeamlessM4T v2 model...")
+        model_name = "facebook/seamless-m4t-v2-large"
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device for Whisper: {device}")
-        WHISPER_MODEL = whisper.load_model("base", device=device)
-    return WHISPER_MODEL
+        print(f"Using device for SeamlessM4T: {device}")
 
-def setup_translation_model():
-    """Loads the NLLB translation model if not already loaded."""
-    global TRANSLATION_MODEL, TRANSLATION_TOKENIZER
-    if TRANSLATION_MODEL is None:
-        print("Loading NLLB Translation model...")
-        model_name = "facebook/nllb-200-distilled-600M"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device for NLLB: {device}")
+        SEAMLESS_PROCESSOR = AutoProcessor.from_pretrained(model_name)
+        SEAMLESS_MODEL = SeamlessM4Tv2Model.from_pretrained(model_name).to(device)
 
-        TRANSLATION_TOKENIZER = AutoTokenizer.from_pretrained(model_name)
-        TRANSLATION_MODEL = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+    return SEAMLESS_PROCESSOR, SEAMLESS_MODEL
 
-    return TRANSLATION_MODEL, TRANSLATION_TOKENIZER
+def process_audio_seamless(audio_path, target_lang="spa", output_path="translated_vocals.wav"):
+    """
+    Translates audio to target language using SeamlessM4T v2.
+    Returns path to translated audio.
+    """
+    print(f"Translating audio {audio_path} to {target_lang}...")
+
+    processor, model = load_seamless_model()
+    device = model.device
+
+    # Map language codes
+    # Simplified mapping based on common usage
+    lang_map = {
+        "es": "spa",
+        "fr": "fra",
+        "de": "deu",
+        "it": "ita",
+        "pt": "por",
+        "nl": "nld",
+        "ru": "rus",
+        "ja": "jpn",
+        "ko": "kor",
+        "zh": "cmn", # Mandarin Chinese
+        "en": "eng"
+    }
+    tgt_lang_code = lang_map.get(target_lang, "eng")
+
+    # Load audio
+    waveform, sample_rate = torchaudio.load(audio_path)
+
+    # Resample to 16kHz required by SeamlessM4T
+    if sample_rate != 16000:
+        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+        waveform = resampler(waveform)
+        sample_rate = 16000
+
+    # SeamlessM4T expects input shape (batch, time) or (time) depending on processor
+    # Processor handles raw audio array. If waveform is (channels, time), we usually mix to mono.
+    if waveform.shape[0] > 1:
+        # Convert stereo to mono
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+    # Squeeze to (time) if needed, processor expects array or tensor
+    inputs = processor(audio=waveform.squeeze(), sampling_rate=16000, return_tensors="pt").to(device)
+
+    print("Running S2ST inference...")
+    # Generate translated speech
+    with torch.no_grad():
+        output = model.generate(**inputs, tgt_lang=tgt_lang_code)
+
+    # Output[0] is the waveform tensor
+    translated_waveform = output[0].cpu()
+
+    # Save to file
+    # torchaudio.save expects (channels, time)
+    if translated_waveform.dim() == 1:
+        translated_waveform = translated_waveform.unsqueeze(0)
+
+    torchaudio.save(output_path, translated_waveform, 16000)
+
+    return output_path
 
 def separate_vocals(audio_path, output_dir="separated"):
     """
@@ -96,143 +133,106 @@ def separate_vocals(audio_path, output_dir="separated"):
 
     return vocals_path, no_vocals_path
 
-def transcribe(audio_path):
+def detect_leading_silence(waveform, sample_rate, silence_threshold_db=-50.0, chunk_size_ms=10):
     """
-    Transcribes audio using Whisper.
-    Returns the text and the start time of the first segment (in seconds).
+    waveform: torch.Tensor (channels, time)
+    silence_threshold_db: float
+    chunk_size_ms: int
+    Returns start_time in seconds (float)
     """
-    model = setup_pipeline()
-    print(f"Transcribing: {audio_path}")
-    result = model.transcribe(audio_path)
-    text = result["text"].strip()
+    # Convert threshold to amplitude
+    # dB = 20 * log10(amplitude) -> amplitude = 10 ** (dB / 20)
+    # Note: waveform is usually -1.0 to 1.0.
+    threshold = 10 ** (silence_threshold_db / 20)
 
-    start_time = 0.0
-    if result.get("segments"):
-        # Use the start time of the first segment
-        start_time = result["segments"][0]["start"]
+    chunk_samples = int(sample_rate * chunk_size_ms / 1000)
+    if chunk_samples == 0:
+        return 0.0
 
-    return text, start_time
+    # If stereo, take max amplitude across channels
+    if waveform.shape[0] > 1:
+        wave_mono = torch.max(torch.abs(waveform), dim=0)[0]
+    else:
+        wave_mono = torch.abs(waveform[0])
 
-def translate(text, target_lang="es"):
-    """
-    Translates text to target language using NLLB (Hugging Face).
-    """
-    print(f"Translating to {target_lang}...")
-    try:
-        model, tokenizer = setup_translation_model()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    length = wave_mono.shape[0]
 
-        # Map simple language codes to NLLB codes
-        # Complete list: https://github.com/facebookresearch/flores/blob/main/flores200/README.md#languages-in-flores-200
-        lang_map = {
-            "es": "spa_Latn",
-            "fr": "fra_Latn",
-            "de": "deu_Latn",
-            "it": "ita_Latn",
-            "pt": "por_Latn",
-            "nl": "nld_Latn",
-            "ru": "rus_Cyrl",
-            "ja": "jpn_Jpan",
-            "ko": "kor_Hang",
-            "zh": "zho_Hans",
-            "en": "eng_Latn"
-        }
+    # Iterate in chunks to find start
+    # Pad to multiple of chunk_samples
+    pad_len = (chunk_samples - (length % chunk_samples)) % chunk_samples
+    if pad_len > 0:
+        wave_mono = torch.nn.functional.pad(wave_mono, (0, pad_len))
 
-        target_lang_code = lang_map.get(target_lang, "eng_Latn")
+    num_chunks = wave_mono.shape[0] // chunk_samples
+    chunks = wave_mono.view(num_chunks, chunk_samples)
 
-        # NLLB requires source language too, but we can assume English or detect?
-        # Ideally we use a multilingual model that can handle auto-detection or we use a "forced_bos_token_id".
-        # NLLB is many-to-many. We need to specify the target language.
-        # For NLLB with pipeline, we shouldn't use "translation" task string directly if it complains.
-        # However, huggingface pipeline for translation usually expects translation_XX_to_YY.
-        # But for multilingual models, we can just use the model directly or configure pipeline differently.
-        # The easiest way with NLLB is to use the generate method directly or use the pipeline with model/tokenizer and rely on src_lang/tgt_lang args in call.
+    # Max amplitude per chunk
+    max_per_chunk = torch.max(chunks, dim=1)[0]
 
-        translator = pipeline('translation', model=model, tokenizer=tokenizer, device=0 if device == "cuda" else -1)
+    # Find first chunk > threshold
+    indices = (max_per_chunk > threshold).nonzero(as_tuple=True)[0]
 
-        # Note: If source is not English, accuracy might drop if we force src_lang="eng_Latn".
-        # Ideally we'd detect source lang code, but for PoC we assume input is English or NLLB handles it reasonably.
-        # Actually, NLLB pipeline usage:
-        # We must pass src_lang and tgt_lang here for NLLB
-        output = translator(text, max_length=400, src_lang="eng_Latn", tgt_lang=target_lang_code)
-        translated_text = output[0]['translation_text']
+    if len(indices) == 0:
+        return length / sample_rate # All silent
 
-        return translated_text
-    except Exception as e:
-        print(f"Translation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return text # Fallback to original text
+    first_chunk_idx = indices[0].item()
+    start_time = first_chunk_idx * chunk_size_ms / 1000.0
+    return start_time
 
-async def run_tts_async(text, voice, output_file):
-    try:
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(output_file)
-    except Exception as e:
-        print(f"Error inside run_tts_async: {e}")
-        # Re-raise so calling code knows it failed
-        raise e
-
-def synthesize(text, target_lang="es"):
-    """
-    Synthesizes speech from text using Edge TTS.
-    Returns path to generated audio.
-    """
-    print(f"Synthesizing speech for: {text[:20]}...")
-    output_file = "tts_output.mp3"
-
-    # Map language to a voice
-    voice_map = {
-        "es": "es-ES-AlvaroNeural",
-        "fr": "fr-FR-HenriNeural",
-        "de": "de-DE-KillianNeural",
-        "it": "it-IT-DiegoNeural",
-        "pt": "pt-BR-AntonioNeural",
-        "nl": "nl-NL-MaartenNeural",
-        "ru": "ru-RU-DmitryNeural",
-        "ja": "ja-JP-KeitaNeural",
-        "ko": "ko-KR-InJoonNeural",
-        "zh": "zh-CN-YunxiNeural",
-        "en": "en-US-ChristopherNeural"
-    }
-
-    voice = voice_map.get(target_lang, "en-US-ChristopherNeural")
-
-    # Run async function in sync wrapper
-    try:
-        # asyncio.run() creates a new loop and closes it. It requires no running loop in current thread.
-        # Gradio functions run in a thread pool, so no loop should be active.
-        asyncio.run(run_tts_async(text, voice, output_file))
-    except Exception as e:
-        print(f"Error in synthesize: {e}")
-        raise e
-
-    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
-        raise RuntimeError("TTS output file is empty or not found")
-
-    return output_file
-
-def mix_audio(vocals_path, instrumental_path, start_time=0, output_path="final_mix.mp3"):
-    """
-    Mixes vocals and instrumental.
-    start_time: offset in seconds for the vocals (TTS).
-    """
+def mix_audio(vocals_path, instrumental_path, start_time=0, output_path="final_mix.wav"):
     print(f"Mixing {vocals_path} and {instrumental_path} with offset {start_time}s...")
 
-    # Load audio segments
-    vocals = AudioSegment.from_file(vocals_path) # Might be mp3
-    instrumental = AudioSegment.from_file(instrumental_path) # Might be wav
+    vocals, sr_v = torchaudio.load(vocals_path)
+    instrumental, sr_i = torchaudio.load(instrumental_path)
 
-    # Adjust volume of vocals slightly up?
-    vocals = vocals + 2
+    # Resample vocals if needed
+    if sr_v != sr_i:
+        resampler = torchaudio.transforms.Resample(sr_v, sr_i)
+        vocals = resampler(vocals)
+        sr_v = sr_i
 
-    # Calculate position in milliseconds
-    position = int(start_time * 1000)
+    # Vocals volume boost
+    vocals = vocals * 1.5
 
-    # Overlay vocals on instrumental
-    mixed = instrumental.overlay(vocals, position=position)
+    # Offset
+    offset_samples = int(start_time * sr_i)
 
-    mixed.export(output_path, format="mp3")
+    # Create empty tensor for mix
+    # Length is max(instrumental length, offset + vocals length)
+    max_len = max(instrumental.shape[1], offset_samples + vocals.shape[1])
+
+    mix = torch.zeros((instrumental.shape[0], max_len))
+
+    # Add instrumental
+    mix[:, :instrumental.shape[1]] += instrumental
+
+    # Add vocals
+    # Handle channel mismatch
+    # If vocals mono, expand to stereo if instrumental is stereo
+    if vocals.shape[0] == 1 and instrumental.shape[0] == 2:
+        vocals = vocals.repeat(2, 1)
+
+    # Ensure vocals fits in mix bounds
+    end_sample = offset_samples + vocals.shape[1]
+
+    # Add to mix
+    # Note: mix has shape (channels, max_len)
+    # We need to ensure we don't exceed channels of mix if vocals has more?
+    # Usually we match instrumental channels.
+
+    target_channels = instrumental.shape[0]
+    if vocals.shape[0] == target_channels:
+         mix[:, offset_samples:end_sample] += vocals
+    else:
+        # Fallback: just add first channel? Or skipping
+        print("Warning: Channel mismatch in mixing, attempting to broadcast or slice")
+        mix[:min(vocals.shape[0], target_channels), offset_samples:end_sample] += vocals[:min(vocals.shape[0], target_channels)]
+
+    # Clip to -1.0, 1.0
+    mix = torch.clamp(mix, -1.0, 1.0)
+
+    # Save as WAV
+    torchaudio.save(output_path, mix, sr_i)
     return output_path
 
 def process_song(audio_file, target_lang):
@@ -243,31 +243,36 @@ def process_song(audio_file, target_lang):
         # 1. Separate
         vocals_path, no_vocals_path = separate_vocals(audio_file)
 
-        # 2. Transcribe
-        original_lyrics, start_time = transcribe(vocals_path)
+        # 2. Trim silence from vocals to optimize S2ST
+        vocals, sr = torchaudio.load(vocals_path)
+        start_time_sec = detect_leading_silence(vocals, sr)
 
-        if not original_lyrics:
-            print("No lyrics detected.")
-            original_lyrics = "[No lyrics detected]"
-            translated_lyrics = "[No translation]"
-            # Return instrumental only as final mix
-            return no_vocals_path, vocals_path, original_lyrics, translated_lyrics
+        # If the whole track is silent?
+        duration = vocals.shape[1] / sr
+        if start_time_sec >= duration:
+             print("Vocals seem silent.")
+             return no_vocals_path, vocals_path, "No vocals detected", "No translation"
 
-        # 3. Translate
-        translated_lyrics = translate(original_lyrics, target_lang)
+        # Create trimmed version
+        start_sample = int(start_time_sec * sr)
+        trimmed_vocals = vocals[:, start_sample:]
 
-        # 4. Synthesize
-        tts_audio_path = synthesize(translated_lyrics, target_lang)
+        trimmed_vocals_path = vocals_path.replace("vocals.wav", "vocals_trimmed.wav")
+        torchaudio.save(trimmed_vocals_path, trimmed_vocals, sr)
 
-        # 5. Mix
-        # Use the start_time from Whisper to align the TTS audio
-        final_mix_path = mix_audio(tts_audio_path, no_vocals_path, start_time=start_time)
+        print(f"Vocals start at {start_time_sec:.2f} seconds")
+
+        # 3. Translate Speech-to-Speech
+        translated_vocals_path = process_audio_seamless(trimmed_vocals_path, target_lang, output_path=vocals_path.replace("vocals.wav", "translated_vocals.wav"))
+
+        # 4. Mix
+        final_mix_path = mix_audio(translated_vocals_path, no_vocals_path, start_time=start_time_sec)
 
         return (
             final_mix_path,
             vocals_path,
-            original_lyrics,
-            translated_lyrics
+            "Lyrics extraction not supported in this mode",
+            f"Translation is Speech-to-Speech via SeamlessM4T ({target_lang})"
         )
     except Exception as e:
         print(f"Error processing song: {e}")

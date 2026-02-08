@@ -6,14 +6,14 @@ def run_pipeline(audio_file, target_lang):
         return None, None, "Please upload an audio file.", ""
 
     print(f"Processing {audio_file} to {target_lang}")
-    final_mix, vocals, original_lyrics, translated_lyrics = process_song(audio_file, target_lang)
+    final_mix, vocals, status_msg, translated_info = process_song(audio_file, target_lang)
 
-    return final_mix, vocals, original_lyrics, translated_lyrics
+    return final_mix, vocals, status_msg, translated_info
 
 # Define the interface
-with gr.Blocks(title="Song Translator PoC") as demo:
-    gr.Markdown("# 🎵 AI Song Translator")
-    gr.Markdown("Upload a song, choose a language, and get a translated version (spoken/sung)!")
+with gr.Blocks(title="Song Translator PoC - SeamlessM4T") as demo:
+    gr.Markdown("# 🎵 AI Song Translator (SeamlessM4T Edition)")
+    gr.Markdown("Upload a song, choose a language, and get a translated version using Meta's SeamlessM4T v2 (Speech-to-Speech Translation).")
 
     with gr.Row():
         with gr.Column():
@@ -23,15 +23,15 @@ with gr.Blocks(title="Song Translator PoC") as demo:
                 choices=["es", "fr", "de", "it", "pt", "nl", "ru", "ja", "ko", "zh", "en"],
                 value="es"
             )
-            submit_btn = gr.Button("Translate & Sing", variant="primary")
+            submit_btn = gr.Button("Translate", variant="primary")
 
         with gr.Column():
             final_output = gr.Audio(label="Final Translated Mix")
             vocals_output = gr.Audio(label="Extracted Vocals")
 
     with gr.Row():
-        original_text = gr.Textbox(label="Original Lyrics", lines=10)
-        translated_text = gr.Textbox(label="Translated Lyrics", lines=10)
+        original_text = gr.Textbox(label="Status / Info", lines=2)
+        translated_text = gr.Textbox(label="Translation Details", lines=2)
 
     submit_btn.click(
         fn=run_pipeline,
