@@ -2,7 +2,8 @@ import os
 import shutil
 import subprocess
 import torch
-from transformers import AutoProcessor, SeamlessM4Tv2Model
+from pathlib import Path
+from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToSpeech
 import torchaudio
 
 # Global model cache
@@ -19,7 +20,7 @@ def load_seamless_model():
         print(f"Using device for SeamlessM4T: {device}")
 
         SEAMLESS_PROCESSOR = AutoProcessor.from_pretrained(model_name)
-        SEAMLESS_MODEL = SeamlessM4Tv2Model.from_pretrained(model_name).to(device)
+        SEAMLESS_MODEL = SeamlessM4Tv2ForSpeechToSpeech.from_pretrained(model_name).to(device)
 
     return SEAMLESS_PROCESSOR, SEAMLESS_MODEL
 
@@ -28,10 +29,10 @@ def process_audio_seamless(audio_path, target_lang="spa", output_path="translate
     Translates audio to target language using SeamlessM4T v2.
     Returns path to translated audio.
     """
-    print(f"Translating audio {audio_path} to {target_lang}...")
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        raise ValueError(f"Audio file not found or empty: {audio_path}")
 
-    processor, model = load_seamless_model()
-    device = model.device
+    print(f"Translating audio {audio_path} to {target_lang}...")
 
     # Map language codes
     # Simplified mapping based on common usage
@@ -48,10 +49,20 @@ def process_audio_seamless(audio_path, target_lang="spa", output_path="translate
         "zh": "cmn", # Mandarin Chinese
         "en": "eng"
     }
-    tgt_lang_code = lang_map.get(target_lang, "eng")
 
-    # Load audio
-    waveform, sample_rate = torchaudio.load(audio_path)
+    if target_lang not in lang_map:
+        raise ValueError(f"Unsupported target language: {target_lang}. Supported: {list(lang_map.keys())}")
+
+    tgt_lang_code = lang_map[target_lang]
+
+    try:
+        # Load audio
+        waveform, sample_rate = torchaudio.load(audio_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load audio file {audio_path}: {e}")
+
+    processor, model = load_seamless_model()
+    device = model.device
 
     # Resample to 16kHz required by SeamlessM4T
     if sample_rate != 16000:
@@ -191,8 +202,13 @@ def mix_audio(vocals_path, instrumental_path, start_time=0, output_path="final_m
         vocals = resampler(vocals)
         sr_v = sr_i
 
-    # Vocals volume boost
-    vocals = vocals * 1.5
+    # Vocals volume boost with clipping protection
+    peak = torch.max(torch.abs(vocals))
+    if peak > 0:
+        gain = min(1.5, 1.0 / peak)
+    else:
+        gain = 1.0
+    vocals = vocals * gain
 
     # Offset
     offset_samples = int(start_time * sr_i)
@@ -208,24 +224,29 @@ def mix_audio(vocals_path, instrumental_path, start_time=0, output_path="final_m
 
     # Add vocals
     # Handle channel mismatch
+    target_channels = instrumental.shape[0]
+
     # If vocals mono, expand to stereo if instrumental is stereo
-    if vocals.shape[0] == 1 and instrumental.shape[0] == 2:
+    if vocals.shape[0] == 1 and target_channels == 2:
         vocals = vocals.repeat(2, 1)
+    elif vocals.shape[0] > target_channels:
+        # Explicit downmix by averaging channels
+        vocals = torch.mean(vocals, dim=0, keepdim=True)
+        # If target is more than 1 (e.g. instrumental is 2, vocals was >2 and now 1), expand again
+        if target_channels > 1:
+            vocals = vocals.repeat(target_channels, 1)
 
     # Ensure vocals fits in mix bounds
     end_sample = offset_samples + vocals.shape[1]
 
     # Add to mix
-    # Note: mix has shape (channels, max_len)
-    # We need to ensure we don't exceed channels of mix if vocals has more?
-    # Usually we match instrumental channels.
-
-    target_channels = instrumental.shape[0]
+    # Channels should now match or be broadcastable, but we force slice to be safe
+    # vocals should match target_channels due to logic above
     if vocals.shape[0] == target_channels:
-         mix[:, offset_samples:end_sample] += vocals
+        mix[:, offset_samples:end_sample] += vocals
     else:
-        # Fallback: just add first channel? Or skipping
-        print("Warning: Channel mismatch in mixing, attempting to broadcast or slice")
+        # Should ideally not happen with above logic, but as failsafe:
+        print("Warning: Channel mismatch persisted in mixing, slicing")
         mix[:min(vocals.shape[0], target_channels), offset_samples:end_sample] += vocals[:min(vocals.shape[0], target_channels)]
 
     # Clip to -1.0, 1.0
@@ -250,20 +271,22 @@ def process_song(audio_file, target_lang):
         # If the whole track is silent?
         duration = vocals.shape[1] / sr
         if start_time_sec >= duration:
-             print("Vocals seem silent.")
-             return no_vocals_path, vocals_path, "No vocals detected", "No translation"
+            print("Vocals seem silent.")
+            return no_vocals_path, vocals_path, "No vocals detected", "No translation"
 
         # Create trimmed version
         start_sample = int(start_time_sec * sr)
         trimmed_vocals = vocals[:, start_sample:]
 
-        trimmed_vocals_path = vocals_path.replace("vocals.wav", "vocals_trimmed.wav")
+        vocals_path_obj = Path(vocals_path)
+        trimmed_vocals_path = str(vocals_path_obj.parent / "vocals_trimmed.wav")
         torchaudio.save(trimmed_vocals_path, trimmed_vocals, sr)
 
         print(f"Vocals start at {start_time_sec:.2f} seconds")
 
         # 3. Translate Speech-to-Speech
-        translated_vocals_path = process_audio_seamless(trimmed_vocals_path, target_lang, output_path=vocals_path.replace("vocals.wav", "translated_vocals.wav"))
+        translated_vocals_path = str(vocals_path_obj.parent / "translated_vocals.wav")
+        process_audio_seamless(trimmed_vocals_path, target_lang, output_path=translated_vocals_path)
 
         # 4. Mix
         final_mix_path = mix_audio(translated_vocals_path, no_vocals_path, start_time=start_time_sec)
