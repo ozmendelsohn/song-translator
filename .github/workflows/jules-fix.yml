@@ -1,6 +1,10 @@
 name: Jules Auto-Fix
 on:
   pull_request:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
 
 permissions:
   contents: write
@@ -9,21 +13,52 @@ permissions:
 
 jobs:
   jules-fix:
-    if: github.actor != 'github-actions[bot]'
+    if: |
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+      (github.event_name == 'pull_request_review_comment')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout PR (Pull Request)
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+
+      - name: Checkout PR (Issue Comment)
+        if: github.event_name == 'issue_comment'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+
+      - name: Checkout PR (Review Comment)
+        if: github.event_name == 'pull_request_review_comment'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+
       - name: Tag PR with fix
         uses: actions/github-script@v6
         with:
           script: |
-            github.rest.issues.addLabels({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: ['fix']
-            })
+            // Determine issue number based on event type
+            let issue_number;
+            if (context.eventName === 'pull_request') {
+              issue_number = context.issue.number;
+            } else if (context.eventName === 'issue_comment') {
+              issue_number = context.payload.issue.number;
+            } else if (context.eventName === 'pull_request_review_comment') {
+              issue_number = context.payload.pull_request.number;
+            }
+
+            if (issue_number) {
+              github.rest.issues.addLabels({
+                issue_number: issue_number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: ['fix']
+              })
+            }
+
       - uses: google-labs-code/jules-invoke@main
         with:
-          prompt: "Analyze the current PR and the latest review comments. Apply the requested fixes and update the branch."
+          prompt: "Analyze the current PR and ALL comments, specifically from the automatic tool. Apply the requested fixes and update the branch. Do not add any reaction emojis to the comments."
           api_key: ${{ secrets.JULES_API_KEY }}
